@@ -21,6 +21,7 @@ import psycopg2
 from flask import Flask, jsonify, render_template, request
 
 from wait_snapshot import fetch_inventory, fetch_lock_waits
+from wait_timeline import MAX_WAIT_RECORDS, Timeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,8 +45,8 @@ TRANSFERS = {
 }
 ORDERED_LOCATIONS = ["A-01", "A-02"]
 
-# 快照最多保留多少条，避免长时间等待时内存无限增长
-MAX_SNAPSHOTS = 600
+# 每轮内存最多保留多少条等待采样记录，避免长时间等待时无限增长
+MAX_SNAPSHOTS = MAX_WAIT_RECORDS
 # 等待关系采样间隔（秒）
 SAMPLE_INTERVAL = 0.1
 # 历史轮次最多保留多少轮
@@ -83,18 +84,20 @@ class Run:
     created_at: str = field(default_factory=now_iso)
     finished_at: str | None = None
     start_ts: float = 0.0
-    snapshots: list[dict] = field(default_factory=list)
+    timeline: Timeline = field(default_factory=lambda: Timeline(MAX_SNAPSHOTS))
     workers: dict = field(default_factory=dict)
     cancel_event: threading.Event = field(default_factory=threading.Event)
     conns: dict = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
     inventory_after: list[dict] | None = None
     wait_cycle: list[str] | None = None
+    wait_cycle_detail: dict | None = None
     deadlock_victim: str | None = None
     db_declared_deadlock: bool = False
 
     def public(self):
         with self.lock:
+            waits = self.timeline.public()
             return {
                 "run_id": self.run_id,
                 "lock_order": self.lock_order,
@@ -106,19 +109,61 @@ class Run:
                 "error": self.error,
                 "created_at": self.created_at,
                 "finished_at": self.finished_at,
-                "snapshots": self.snapshots,
+                # 面板只消费聚合后的 waits；不重复回传 600 条原始记录
+                # （原始快照通过 waits.pinned_raw_snapshot /
+                #  deadlock_detail.raw_snapshot 按需返回）
+                "waits": waits,
                 "workers": self.workers,
                 "inventory_after": self.inventory_after,
                 "wait_cycle": self.wait_cycle,
+                "wait_cycle_detail": {
+                    "source": (self.wait_cycle_detail or {}).get("source", "none"),
+                    "cycle_snapshot_seq": (self.wait_cycle_detail or {}).get("cycle_snapshot_seq"),
+                },
+                "deadlock_detail": self.deadlock_detail(),
                 "deadlock_victim": self.deadlock_victim,
                 "db_declared_deadlock": self.db_declared_deadlock,
                 "transfers": TRANSFERS,
             }
 
-    def add_snapshot(self, snap: dict):
+    def deadlock_detail(self) -> dict:
+        """死锁详情：唯一判定依据是 40P01；等待环原始快照尽力定位。"""
+        detail = {
+            "declared": self.db_declared_deadlock,
+            "sqlstate": "40P01" if self.db_declared_deadlock else None,
+            "victim": self.deadlock_victim,
+            "cycle": self.wait_cycle,
+            "raw_snapshot": None,
+            "snapshot_available": False,
+            "note": "",
+        }
+        if not self.db_declared_deadlock:
+            detail["note"] = "数据库未返回 40P01，本轮不判定为死锁。"
+            return detail
+        cycle_detail = self.wait_cycle_detail or {}
+        raw = cycle_detail.get("raw_snapshot")
+        detail["raw_snapshot"] = raw
+        detail["snapshot_available"] = raw is not None
+        if raw is not None:
+            detail["note"] = (
+                f"等待环采自第 #{raw['seq']} 次采样（轮次内 t={raw['t']}s），"
+                "以下为该次原始快照。"
+            )
+        else:
+            detail["note"] = (
+                "数据库判定死锁（40P01），但本轮采样没有捕获到完整等待环的原始快照"
+                "（等待窗口短于采样间隔，或采样记录已被裁剪），无法用快照定位等待环。"
+            )
+        return detail
+
+    def record_sample(self, sample_no: int, t: float, edges: list[dict] | None,
+                      error: str | None):
         with self.lock:
-            if len(self.snapshots) < MAX_SNAPSHOTS:
-                self.snapshots.append(snap)
+            captured_at = now_iso()
+            if error is None:
+                self.timeline.append_ok(sample_no, t, captured_at, edges or [])
+            else:
+                self.timeline.append_error(sample_no, t, captured_at, error)
 
     def update_worker(self, key: str, patch: dict):
         with self.lock:
@@ -275,23 +320,34 @@ def monitor(run: Run, barrier: threading.Barrier):
         log.warning("monitor barrier broken, exiting")
         return
     admin = connect("locklab-monitor")
+    # 监控只读且每 100ms 采样一次，不保留长事务快照
+    admin.autocommit = True
     sample_no = 0
     try:
         while True:
             time.sleep(SAMPLE_INTERVAL)
             sample_no += 1
+            t = round(time.time() - run.start_ts, 3)
             try:
                 edges = fetch_lock_waits(admin)
                 _annotate_waited_locations(run, edges)
+                run.record_sample(sample_no, t, edges, None)
             except Exception as exc:  # noqa: BLE001
+                # 查询失败 = 等待状态未知；不能当成“无等待”，也不能与前后段合并
                 log.warning("snapshot failed: %s", exc)
-                edges = []
-            snap = {
-                "t": round(time.time() - run.start_ts, 3),
-                "sample": sample_no,
-                "edges": edges,
-            }
-            run.add_snapshot(snap)
+                try:
+                    admin.rollback()
+                except Exception:  # noqa: BLE001 - 连接已断开时忽略
+                    pass
+                run.record_sample(sample_no, t, None, f"{type(exc).__name__}: {exc}")
+                # 监控连接若已断开，重连后继续采样，避免整轮都失去观测
+                if admin.closed:
+                    try:
+                        admin.close()
+                    except Exception:  # pragma: no cover
+                        pass
+                    admin = connect("locklab-monitor")
+                    admin.autocommit = True
 
             # 硬性兜底超时：取消并强制 terminate 本轮连接，避免遗留
             if time.time() - run.start_ts > run.hard_timeout_s:
@@ -361,22 +417,48 @@ def reset_inventory():
         conn.close()
 
 
-def derive_wait_cycle(run: Run):
-    """从数据库观测到的等待边里找环（仅用于页面高亮，死锁判定仍只看 40P01）。"""
-    graph: dict[str, set[str]] = {}
-    for snap in run.snapshots:
-        for e in snap["edges"]:
-            graph.setdefault(e["blocked_app"], set()).add(e["blocking_app"])
+def _find_cycle(graph: dict[str, set[str]]):
     for start in graph:
         stack = [(start, [start])]
         while stack:
             node, path = stack.pop()
-            for nxt in graph.get(node, ()):  # type: ignore[union-attr]
+            for nxt in graph.get(node, ()):
                 if nxt == start and len(path) >= 2:
                     return path + [start]
                 if nxt not in path:
                     stack.append((nxt, path + [nxt]))
     return None
+
+
+def derive_wait_cycle(run: Run):
+    """从数据库观测到的等待边里找环（仅用于页面高亮，死锁判定仍只看 40P01）。
+
+    同时尝试把等待环定位到**单次采样**的原始快照：只有同一次采样里集齐了
+    环上的所有边，才认为该次快照能证明等待环；否则明示“没有采到”。
+    """
+    for record in run.timeline.records():
+        if record["status"] != "waiting":
+            continue
+        graph: dict[str, set[str]] = {}
+        for e in record["edges"]:
+            graph.setdefault(e["blocked_app"], set()).add(e["blocking_app"])
+        cycle = _find_cycle(graph)
+        if cycle:
+            return cycle, {
+                "source": "single_sample",
+                "raw_snapshot": record,
+                "cycle_snapshot_seq": record["seq"],
+            }
+
+    # 单次采样都没集齐：退回全轮聚合图，仅用于高亮，不冒充原始快照
+    graph = {}
+    for record in run.timeline.records():
+        for e in record["edges"]:
+            graph.setdefault(e["blocked_app"], set()).add(e["blocking_app"])
+    cycle = _find_cycle(graph)
+    if cycle:
+        return cycle, {"source": "aggregate", "raw_snapshot": None}
+    return None, {"source": "none", "raw_snapshot": None}
 
 
 def run_supervisor(run: Run):
@@ -404,7 +486,7 @@ def run_supervisor(run: Run):
         finally:
             admin.close()
 
-        run.wait_cycle = derive_wait_cycle(run)
+        run.wait_cycle, run.wait_cycle_detail = derive_wait_cycle(run)
         with run.lock:
             if run.status == "running":
                 run.status = "cancelled" if run.error else "finished"

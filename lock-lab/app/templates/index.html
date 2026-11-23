@@ -51,7 +51,23 @@
   .edge { background:#0b1220; border:1px solid var(--line); border-radius:7px; padding:9px 11px; margin-bottom:8px; }
   .arrow { color:var(--amber); font-weight:700; }
   .cycle { color:var(--red); font-weight:700; }
-  .timeline-wrap { max-height:260px; overflow:auto; }
+  .timeline-wrap { max-height:320px; overflow:auto; }
+  .seg { border-left:3px solid var(--line); padding:8px 11px; margin-bottom:8px; background:#0b1220; border-radius:6px; }
+  .seg.waiting { border-left-color:var(--amber); }
+  .seg.no_wait { border-left-color:var(--muted); }
+  .seg.unknown { border-left-color:var(--purple); }
+  .seg.gap { border-left-color:var(--red); background:rgba(248,113,113,.08); }
+  .seg.pinned { box-shadow:0 0 0 1px var(--red) inset; }
+  .badge { display:inline-block; padding:0 7px; border-radius:999px; font-size:11px; font-weight:600; margin-left:4px; }
+  .badge.waiting { background:rgba(251,191,36,.18); color:var(--amber); }
+  .badge.no_wait { background:rgba(148,163,184,.18); color:var(--muted); }
+  .badge.unknown { background:rgba(192,132,252,.18); color:var(--purple); }
+  .badge.gap { background:rgba(248,113,113,.18); color:var(--red); }
+  .badge.pin { background:rgba(248,113,113,.18); color:var(--red); }
+  .stats { display:flex; flex-wrap:wrap; gap:14px; font-size:12px; color:var(--muted); margin-bottom:12px; }
+  .stats b { color:var(--txt); }
+  .rawsnap { background:#0b1220; border:1px dashed var(--red); border-radius:7px; padding:10px 12px; margin-top:10px; }
+  .rawsnap h4 { margin:0 0 6px; font-size:13px; color:var(--red); }
   .kv { display:grid; grid-template-columns:130px 1fr; gap:4px 10px; font-size:13px; }
   .kv .k { color:var(--muted); }
   .hist-btn { text-align:left; width:100%; background:#0b1220; color:var(--txt); border:1px solid var(--line);
@@ -99,10 +115,16 @@
   </section>
 
   <section class="panel">
-    <h2>③ 数据库实际观测到的等待关系（每 200ms 采样自 v_lock_waits）</h2>
+    <h2>③ 等待面板（每 100ms 采样自 v_lock_waits，只展示数据库实测）</h2>
+    <div class="stats" id="waitStats"></div>
     <div id="waitNow"><p class="muted">暂无数据</p></div>
-    <h2 style="margin-top:18px;">等待采样时间线</h2>
-    <div class="timeline-wrap mono" id="snapTimeline"><p class="muted">暂无数据</p></div>
+    <div id="pinnedRaw"></div>
+    <h2 style="margin-top:18px;">等待采样分段</h2>
+    <p class="muted" style="margin-top:-6px;font-size:12px;">
+      连续采到的同一组等待边合并为一段（按双方 PID、锁类型、模式、库位区分），展示首末采样时间与采样次数。
+      <b>未知</b>（查询失败）与<b>无等待</b>分开，前后两段不跨失败合并；裁剪掉的历史以“缺失时段”标出。
+    </p>
+    <div class="timeline-wrap" id="snapSegments"><p class="muted">暂无数据</p></div>
   </section>
 
   <section class="panel">
@@ -149,7 +171,7 @@ $('startBtn').onclick = async () => {
     currentRunId = r.run_id;
     $('startBtn').disabled = true; $('cancelBtn').disabled = false;
     $('runPanel').style.display = '';
-    pollTimer = setInterval(() => poll(currentRunId), 500);
+    pollTimer = setInterval(() => poll(currentRunId), 200);
     poll(currentRunId);
     $('formMsg').textContent = '';
   } catch (e) { $('formMsg').textContent = e.message; }
@@ -175,28 +197,133 @@ async function poll(id) {
 function verdictHtml(r) {
   if (r.status === 'running')
     return '<div class="banner warn pulse">⏳ 实验进行中，正在从数据库采集等待关系…</div>';
-  if (r.db_declared_deadlock)
-    return `<div class="banner deadlock">💀 数据库判定死锁（SQLSTATE 40P01）：被回滚的一笔是 <b>${esc(r.deadlock_victim)}</b>，另一笔正常提交。等待环见下方采样。</div>`;
-  const results = Object.values(r.workers).map(w => w.result);
-  if (results.every(x => x === 'committed'))
+  if (r.db_declared_deadlock) {
+    const d = r.deadlock_detail || {};
+    const snap = d.snapshot_available
+      ? `等待环原始快照已定位（第 #${d.raw_snapshot.seq} 次采样），见下方等待面板。`
+      : '但本轮<b>没有采到等待环的原始快照</b>，无法用快照定位等待环（详见下方死锁详情）。';
+    return `<div class="banner deadlock">💀 数据库判定死锁（SQLSTATE 40P01）：被回滚的一笔是 <b>${esc(r.deadlock_victim)}</b>，另一笔正常提交。${snap}</div>`;
+  }
+  const results = Object.values(r.workers || {}).map(w => w.result);
+  if (results.length === 2 && results.every(x => x === 'committed'))
     return '<div class="banner ok">✅ 未发生死锁：两笔调拨均已提交（相同次序下表现为排队等待后依次放行）。</div>';
   if (results.includes('rolled_back'))
     return '<div class="banner warn">⚠️ 存在回滚但数据库未判定为死锁（通常是 lock_timeout 或手动取消），具体原因见调拨单卡片。</div>';
   return '<div class="banner warn">本轮未正常完成。</div>';
 }
 
+function edgeLine(e) {
+  const loc = e.waited_location ? `｜等待库位 <b>${esc(e.waited_location)}</b>` : '｜等待库位未采到';
+  return `<b>${esc(e.blocked_app)}</b> <span class="muted">(pid ${esc(e.blocked_pid)})</span> ` +
+    `<span class="arrow">等待 →</span> <b>${esc(e.blocking_app)}</b> <span class="muted">(pid ${esc(e.blocking_pid)})</span> ` +
+    `<span class="muted">｜${esc(e.lock_type)} / ${esc(e.lock_mode)}</span> ${loc}` +
+    (e.relation ? ` <span class="muted">｜${esc(e.relation)}</span>` : '');
+}
+
+function renderRawSnapshot(record, title) {
+  if (!record) return '';
+  const edges = (record.edges || []).map(e =>
+    `<div class="mono" style="margin:3px 0">${edgeLine(e)}</div>`).join('');
+  return `<div class="rawsnap">
+    <h4>${esc(title)}</h4>
+    <div class="muted mono">第 #${record.seq} 次采样 · 轮次内 t=${record.t}s · 采集于 ${esc(record.captured_at)}</div>
+    <div style="margin-top:6px">${edges}</div>
+  </div>`;
+}
+
+function statusLabel(status) {
+  return {waiting:'等待', no_wait:'无等待', unknown:'未知'}[status] || status;
+}
+
+function segmentHtml(item) {
+  if (item.item_type === 'gap') {
+    return `<div class="seg gap"><span class="badge gap">缺失时段</span>
+      <b>${esc(item.message)}</b></div>`;
+  }
+  const label = statusLabel(item.kind);
+  const pinned = item.pinned ? '<span class="badge pin">钉住原始快照</span>' : '';
+  const edges = item.kind === 'waiting'
+    ? item.edges.map(e => `<div class="mono" style="margin-top:4px">${edgeLine(e)}</div>`).join('')
+    : '';
+  const err = item.kind === 'unknown'
+    ? `<div class="mono" style="margin-top:4px;color:var(--purple)">查询失败：${esc(item.error)}</div>`
+    : '';
+  return `<div class="seg ${esc(item.kind)}${item.pinned ? ' pinned' : ''}">
+    <span class="badge ${esc(item.kind)}">${esc(label)}</span>${pinned}
+    <span class="mono muted" style="margin-left:6px">
+      采样 #${item.first_sample}–#${item.last_sample}（t=${item.first_t}s → ${item.last_t}s） ·
+      ${esc(item.first_at)} → ${esc(item.last_at)} · 共 ${item.sample_count} 次采样
+    </span>${edges}${err}</div>`;
+}
+
+function renderWaits(r) {
+  const w = r.waits || {};
+  const latestOk = w.latest_ok;
+  const items = w.items || [];
+  const segCount = kind => items.filter(i => i.kind === kind).length;
+  const gapCount = items.filter(i => i.item_type === 'gap').length;
+  $('waitStats').innerHTML = [
+    ['保留采样记录', `${w.retained_records ?? 0} / ${w.max_records ?? 600}`],
+    ['累计采样次数', `${w.total_samples ?? 0}`],
+    ['已裁剪采样', `${w.dropped_records ?? 0}`],
+    ['段数：等待 / 未知 / 无等待',
+      `${segCount('waiting')} / ${segCount('unknown')} / ${segCount('no_wait')}`],
+    ['缺失时段', `${gapCount}`],
+  ].map(([k,v]) => `<span>${k}：<b>${esc(v)}</b></span>`).join('');
+
+  // 面板始终显示最新成功实测；最后一次失败单独提示，不回退成“无等待”
+  const latest = w.latest;
+  if (!latest) {
+    $('waitNow').innerHTML = `<p class="muted">${r.status==='running'
+      ? '尚未完成第一次采样…' : '本轮没有采样记录'}</p>`;
+  } else if (latestOk === null) {
+    $('waitNow').innerHTML = `<div class="seg unknown"><span class="badge unknown">未知</span>
+      尚未获得任何一次成功的采样，等待状态未知：${esc(latest.error || '')}</div>`;
+  } else {
+    const lastStatus = latestOk.status === 'waiting'
+      ? `<span class="badge waiting">等待</span> 当前实测仍存在 ${latestOk.edges.length} 条等待边（第 #${latestOk.seq} 次采样，t=${latestOk.t}s）`
+      : `<span class="badge no_wait">无等待</span> 当前实测无等待边（第 #${latestOk.seq} 次采样，t=${latestOk.t}s）`;
+    const failedNote = latest.status === 'unknown'
+      ? `<div class="seg unknown" style="margin-top:8px"><span class="badge unknown">最近一次查询失败</span>
+           第 #${latest.seq} 次采样失败，等待状态未知，已保留上一次成功实测：${esc(latest.error || '')}</div>`
+      : '';
+    const edges = latestOk.edges.map(e => `<div class="edge">${edgeLine(e)}
+      <div class="mono muted" style="margin-top:5px">等待中的语句：${esc(e.blocked_query)}</div></div>`).join('');
+    $('waitNow').innerHTML = `<div class="muted" style="margin-bottom:8px">${lastStatus}</div>${edges || '<p class="muted">该次采样无等待边</p>'}${failedNote}`;
+  }
+
+  // 首次互等的原始快照（钉住）
+  const pinned = w.pinned_raw_snapshot;
+  $('pinnedRaw').innerHTML = pinned
+    ? renderRawSnapshot(pinned, '首次观测到两笔调拨互等的原始快照（计入 600 条上限，裁剪时保留）')
+    : '';
+
+  // 分段（含缺失时段）
+  if ((w.items || []).length) {
+    $('snapSegments').innerHTML = w.items.map(segmentHtml).join('');
+  } else {
+    $('snapSegments').innerHTML = '<p class="muted">暂无数据</p>';
+  }
+}
+
 function renderRun(r) {
   $('runMeta').textContent = `run=${r.run_id} · 次序=${r.lock_order === 'same' ? '相同' : '相反'} · 状态=${r.status}`;
   $('verdict').innerHTML = verdictHtml(r);
+  const d = r.deadlock_detail || {};
+  const cycleHtml = d.declared
+    ? (d.cycle ? `<span class="cycle">${d.cycle.map(esc).join(' → ')}</span>` : '未采到等待环')
+    : '—';
   $('runKV').innerHTML = [
     ['创建时间', r.created_at], ['结束时间', r.finished_at || '—'],
     ['lock_timeout', r.lock_timeout_ms + ' ms'], ['deadlock_timeout', r.deadlock_timeout_ms + ' ms'],
     ['硬性超时', r.hard_timeout_s + ' s'],
-    ['等待环（基于观测边推导，仅高亮用）', r.wait_cycle ? `<span class="cycle">${r.wait_cycle.map(esc).join(' → ')}</span>` : '—'],
+    ['死锁判定', d.declared ? '数据库返回 40P01' : '无 40P01'],
+    ['等待环', cycleHtml],
+    ['死锁详情', d.declared ? esc(d.note) : '—'],
     ['备注', esc(r.error || '—')],
   ].map(([k,v]) => `<div class="k">${k}</div><div>${v}</div>`).join('');
 
-  $('workers').innerHTML = Object.values(r.workers).sort((a,b)=>a.key.localeCompare(b.key)).map(w => {
+  $('workers').innerHTML = Object.values(r.workers || {}).sort((a,b)=>a.key.localeCompare(b.key)).map(w => {
     const t = r.transfers[w.key];
     const tag = w.phase === 'done'
       ? `<span class="tag ${esc(w.result || 'done')}">${esc(w.result || w.phase)}</span>`
@@ -216,31 +343,24 @@ function renderRun(r) {
       </details></div>`;
   }).join('');
 
-  // 最新一次采样的等待边
-  const last = r.snapshots.length ? r.snapshots[r.snapshots.length-1] : null;
-  if (last && last.edges.length) {
-    $('waitNow').innerHTML = last.edges.map(e => `
-      <div class="edge">
-        <b>${esc(e.blocked_app)}</b> <span class="muted">(pid ${e.blocked_pid})</span>
-        <span class="arrow">等待 →</span>
-        <b>${esc(e.blocking_app)}</b> <span class="muted">(pid ${e.blocking_pid})</span>
-        <span class="muted">｜锁类型 ${esc(e.lock_type)} / ${esc(e.lock_mode)}</span>
-        ${e.waited_location ? `｜等待库位 <b>${esc(e.waited_location)}</b>` : ''}
-        ${e.relation ? `<span class="muted">｜${esc(e.relation)}</span>` : ''}
-        <div class="mono muted" style="margin-top:5px">等待中的语句：${esc(e.blocked_query)}</div>
-      </div>`).join('');
-  } else {
-    $('waitNow').innerHTML = `<p class="muted">${r.status==='running' ? '当前采样点无等待边（可能正处于两笔均未阻塞的瞬间）' : '本轮最后采样点无等待边'}</p>`;
-  }
+  renderWaits(r);
 
-  // 采样时间线
-  if (r.snapshots.length) {
-    $('snapTimeline').innerHTML = r.snapshots.map(s => {
-      if (!s.edges.length) return `<div class="muted">t=${s.t}s #${s.sample}：无等待</div>`;
-      return s.edges.map(e =>
-        `<div>t=${s.t}s #${s.sample}：<b>${esc(e.blocked_app)}</b> <span class="arrow">→</span> <b>${esc(e.blocking_app)}</b>` +
-        ` <span class="muted">[${esc(e.lock_type)}${e.waited_location ? ' ' + esc(e.waited_location) : ''}, 已等 ${e.wait_seconds}s]</span></div>`).join('');
-    }).join('');
+  // 死锁详情里的等待环原始快照（若采到，且不与已钉住的首次互等快照重复）
+  if (d.declared) {
+    const pinnedSeq = (r.waits && r.waits.pinned_raw_snapshot)
+      ? r.waits.pinned_raw_snapshot.seq : null;
+    const raw = d.raw_snapshot;
+    const duplicate = raw && pinnedSeq === raw.seq;
+    if (d.snapshot_available && duplicate) {
+      $('pinnedRaw').insertAdjacentHTML('beforeend',
+        '<p class="muted" style="font-size:12px">上面钉住的首次互等原始快照同时就是等待环快照（第 #' + raw.seq + ' 次采样）。</p>');
+    } else {
+      $('pinnedRaw').insertAdjacentHTML('beforeend',
+        d.snapshot_available
+          ? renderRawSnapshot(raw, '等待环的原始快照（同一次采样内集齐环上所有边）')
+          : `<div class="rawsnap"><h4>等待环原始快照：未采到</h4>
+               <div class="muted">${esc(d.note)}</div></div>`);
+    }
   }
 
   // 库存
